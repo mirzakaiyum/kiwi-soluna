@@ -1,5 +1,6 @@
 import * as aladhan from './providers/aladhan.ts'
 import { CALCULATION_METHODS, type CalculationMethodId, type QueryParams } from './types.ts'
+import { rateLimiter, getClientIP, createRateLimitResponse } from './ratelimit.ts'
 
 /**
  * Kiwi-Soluna: Sun, Moon & Prayer Times API
@@ -10,13 +11,29 @@ import { CALCULATION_METHODS, type CalculationMethodId, type QueryParams } from 
  * - method (optional, default: 1): Calculation method ID (0-23)
  * - date (optional, default: today): Date in DD-MM-YYYY format
  * - methods (optional): If "true", returns list of available methods
+ *
+ * Rate Limiting:
+ * - 30 requests per minute per IP
+ * - Burst capacity of 10 requests
  */
 export default { fetch: main }
 
 async function main(request: Request): Promise<Response> {
 	const url = new URL(request.url)
 	const pathname = url.pathname
-	const address = url.searchParams.get('address') ?? 'London'
+
+	// Apply rate limiting for API requests
+	const clientIP = getClientIP(request)
+	const isApiRequest = pathname.startsWith('/api') || url.searchParams.has('address')
+
+	if (isApiRequest) {
+		if (!rateLimiter.isAllowed(clientIP)) {
+			const retryAfter = rateLimiter.getResetTimeSeconds(clientIP)
+			return createRateLimitResponse(retryAfter)
+		}
+	}
+
+	const addressParam = url.searchParams.get('address')
 	const methodParam = url.searchParams.get('method') ?? '1'
 	const showMethods = url.searchParams.get('methods') ?? ''
 
@@ -25,17 +42,20 @@ async function main(request: Request): Promise<Response> {
 	const contentType = 'application/json'
 	const cacheControl = 'no-cache' // Disable caching
 
+	// Get rate limit info for response headers
+	const remainingTokens = rateLimiter.getRemainingTokens(clientIP)
+
 	try {
 		// Return list of calculation methods
 		if (showMethods === 'true') {
 			body = JSON.stringify({
 				methods: aladhan.getMethods(),
 			})
-			return createResponse(body, status, contentType, cacheControl)
+			return createResponse(body, status, contentType, cacheControl, remainingTokens)
 		}
 
 		// Serve HTML landing page at root
-		if (pathname === '/' && !address) {
+		if (pathname === '/' && !addressParam) {
 			return new Response(LANDING_PAGE_HTML, {
 				status: 200,
 				headers: {
@@ -51,10 +71,10 @@ async function main(request: Request): Promise<Response> {
 		const date = apiMatch ? apiMatch[1] : getTodayDate()
 
 		// Require address for API calls
-		if (!address) {
+		if (!addressParam) {
 			status = 400
 			body = JSON.stringify({ status: 400, error: 'Missing required parameter: address' })
-			return createResponse(body, status, contentType, 'no-cache')
+			return createResponse(body, status, contentType, 'no-cache', remainingTokens)
 		}
 
 		// Parse method
@@ -65,11 +85,11 @@ async function main(request: Request): Promise<Response> {
 				status: 400,
 				error: `Invalid method: ${method}. Valid methods are: ${Object.keys(CALCULATION_METHODS).join(', ')}`,
 			})
-			return createResponse(body, status, contentType, 'no-cache')
+			return createResponse(body, status, contentType, 'no-cache', remainingTokens)
 		}
 
 		const params: QueryParams = {
-			address,
+			address: addressParam,
 			method: method as CalculationMethodId,
 			date,
 		}
@@ -83,19 +103,24 @@ async function main(request: Request): Promise<Response> {
 		console.error(err)
 	}
 
-	return createResponse(body, status, contentType, cacheControl)
+	return createResponse(body, status, contentType, cacheControl, remainingTokens)
 }
 
-function createResponse(body: string, status: number, contentType: string, cacheControl: string): Response {
-	return new Response(body, {
-		status,
-		headers: {
-			'access-control-allow-methods': 'GET',
-			'access-control-allow-origin': '*',
-			'content-type': contentType,
-			'cache-control': cacheControl,
-		},
-	})
+function createResponse(body: string, status: number, contentType: string, cacheControl: string, remainingTokens?: number): Response {
+	const headers: Record<string, string> = {
+		'access-control-allow-methods': 'GET',
+		'access-control-allow-origin': '*',
+		'content-type': contentType,
+		'cache-control': cacheControl,
+	}
+
+	// Add rate limit headers if tokens info is available
+	if (remainingTokens !== undefined) {
+		headers['X-RateLimit-Remaining'] = String(remainingTokens)
+		headers['X-RateLimit-Limit'] = '30' // 30 requests per minute
+	}
+
+	return new Response(body, { status, headers })
 }
 
 /**
